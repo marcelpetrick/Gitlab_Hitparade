@@ -156,30 +156,47 @@ def fetch_project_web_url(session: requests.Session, base_url: str, project_id: 
 
 def build_comment_url(base_url: str, project_web_url: Optional[str], event: dict) -> Optional[str]:
     """
-    Construct a direct browser URL to the note, when possible.
-    For GitLab, anchors are usually #note_<note_id> on the target page.
+    Construct a direct browser URL to the note, preferring fields from event['note'].
+    Falls back to event-level fields if available.
     """
-    note = (event.get("note") or {})  # many GitLab instances include this on commented events
-    note_id = note.get("id")
-    target_type = event.get("target_type")
-    target_iid = event.get("target_iid")  # for Issues/MRs
-    target_id = event.get("target_id")    # for Commits (SHA) and some others
-
     if not project_web_url:
         return None
 
+    note = (event.get("note") or {})
+    note_id = note.get("id")
+
+    # Prefer note.* fields (common on 'Note'/'DiscussionNote' events)
+    n_type = note.get("noteable_type")
+    n_iid = note.get("noteable_iid")
+    n_id  = note.get("noteable_id")  # for commits this is the SHA
+
+    # Fallbacks (rare, but keep them)
+    target_type = event.get("target_type")
+    target_iid  = event.get("target_iid")
+    target_id   = event.get("target_id")
+
     path = None
-    if target_type == "Issue" and target_iid is not None:
-        path = f"/-/issues/{target_iid}"
-    elif target_type == "MergeRequest" and target_iid is not None:
-        path = f"/-/merge_requests/{target_iid}"
-    elif target_type == "Commit" and target_id:
-        path = f"/-/commit/{target_id}"
-    elif target_type == "Snippet" and target_id:
-        path = f"/-/snippets/{target_id}"
+    # Use note-level info first
+    if n_type == "Issue" and n_iid is not None:
+        path = f"/-/issues/{n_iid}"
+    elif n_type == "MergeRequest" and n_iid is not None:
+        path = f"/-/merge_requests/{n_iid}"
+    elif n_type == "Commit" and n_id:
+        path = f"/-/commit/{n_id}"
+    elif n_type == "Snippet" and n_id:
+        path = f"/-/snippets/{n_id}"
     else:
-        # Unknown/unsupported target; we can't build a stable URL.
-        return None
+        # Try event-level as a last resort
+        if target_type == "Issue" and target_iid is not None:
+            path = f"/-/issues/{target_iid}"
+        elif target_type == "MergeRequest" and target_iid is not None:
+            path = f"/-/merge_requests/{target_iid}"
+        elif target_type == "Commit" and target_id:
+            path = f"/-/commit/{target_id}"
+        elif target_type == "Snippet" and target_id:
+            path = f"/-/snippets/{target_id}"
+        else:
+            return None
 
     anchor = f"#note_{note_id}" if note_id is not None else ""
     return f"{project_web_url}{path}{anchor}"
