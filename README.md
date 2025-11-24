@@ -58,3 +58,17 @@ Comments 204
 ## License
 * GPLv3
 * Author: Marcel Petrick // mail@marcelpetrick.it
+
+------
+
+## additional tools
+### filterOpenMilestoneIssues.py
+
+```sh
+export GITLAB_TOKEN=...  # or use --token
+
+python3 filterOpenMilestoneIssues.py \
+  --base-url https://git.data-modul.com \
+  --milestone-url "https://git.data-modul.com/groups/easyanalyzer/-/milestones/6#tab-issues" \
+  --verbose
+```
