@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 GitLab Sprint Time Summary
 
@@ -8,14 +7,14 @@ Fetch all open issues in a GitLab milestone (sprint) and summarize time tracking
 - remaining time (estimate - spent, floored at 0)
 
 Usage examples:
-  python gitlab_sprint_time_summary.py \
+  python filterOpenMilestoneIssues.py \
       --base-url https://git.data-modul.com \
       --milestone-url https://git.data-modul.com/groups/easyanalyzer/-/milestones/6#tab-issues \
       --token $GITLAB_TOKEN
 
-  python gitlab_sprint_time_summary.py \
+  python filterOpenMilestoneIssues.py \
       --base-url https://git.data-modul.com \
-      --milestone-url https://git.data-modul.com/groups/easyanalyzer/-/milestones/6
+      --milestone-url https://git.data-modul.com/groups/easyanalyzer/-/milestones/6#tab-issues
       # reads token from env GITLAB_TOKEN
 """
 
@@ -143,7 +142,7 @@ def get_paginated(
 # ------------------------------
 
 def parse_milestone_url(milestone_url: str) -> Tuple[str, str]:
-    """Parse a GitLab milestone URL and return (group_path, milestone_id).
+    """Parse a GitLab milestone URL and return (group_path, milestone_iid_as_string).
 
     Example path:
       /groups/easyanalyzer/-/milestones/6
@@ -176,11 +175,11 @@ def parse_milestone_url(milestone_url: str) -> Tuple[str, str]:
         raise ValueError(f"Could not find 'milestones' in milestone URL path: {path!r}")
 
     try:
-        milestone_id = parts[idx_m + 1]
+        milestone_iid = parts[idx_m + 1]
     except IndexError:
-        raise ValueError(f"Could not find milestone id after 'milestones' in path: {path!r}")
+        raise ValueError(f"Could not find milestone iid after 'milestones' in path: {path!r}")
 
-    return group_path, milestone_id
+    return group_path, milestone_iid
 
 
 # ------------------------------
@@ -191,32 +190,55 @@ def fetch_milestone(
     session: requests.Session,
     base_url: str,
     group_path: str,
-    milestone_id: str,
+    milestone_iid: str,
 ) -> dict:
-    """Fetch milestone details (to show title, state etc.)."""
+    """Fetch milestone details by IID (the number in the UI URL).
+
+    We query /groups/:id/milestones?iids[]=IID and return the first match.
+    """
     group_id = quote_plus(group_path)
-    url = f"{base_url.rstrip('/')}/api/v4/groups/{group_id}/milestones/{milestone_id}"
-    resp = session.get(url)
+    url = f"{base_url.rstrip('/')}/api/v4/groups/{group_id}/milestones"
+    params = {"iids[]": milestone_iid}
+
+    resp = session.get(url, params=params)
     if resp.status_code != 200:
         raise RuntimeError(f"GET {url} failed: {resp.status_code} {resp.text}")
-    return resp.json()
+
+    data = resp.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(
+            f"No milestone found for IID={milestone_iid!r} in group {group_path!r}"
+        )
+
+    # Usually there will be exactly one
+    return data[0]
 
 
 def fetch_milestone_issues(
     session: requests.Session,
     base_url: str,
     group_path: str,
-    milestone_id: str,
+    milestone: dict,
     per_page: int,
     verbose: bool,
 ) -> List[dict]:
-    """Fetch all issues for a milestone, filtered to opened (not done)."""
+    """Fetch all *open* issues for a given milestone using the group issues endpoint.
+
+    We filter by milestone title:
+      GET /groups/:id/issues?milestone=<title>&state=opened
+    """
     group_id = quote_plus(group_path)
-    url = f"{base_url.rstrip('/')}/api/v4/groups/{group_id}/milestones/{milestone_id}/issues"
+    url = f"{base_url.rstrip('/')}/api/v4/groups/{group_id}/issues"
+    milestone_title = milestone.get("title")
+    if not milestone_title:
+        raise RuntimeError("Milestone object has no title field; cannot filter issues by milestone.")
+
     params = {
-        "state": "opened",  # only not-done issues
-        # you could also add 'include_subgroups': 'true' if needed
+        "state": "opened",            # only not-done issues
+        "milestone": milestone_title,
+        "include_subgroups": "true",  # pick up issues from subgroups too, if you use them
     }
+
     return list(get_paginated(session, url, params=params, per_page=per_page, verbose=verbose))
 
 
@@ -351,21 +373,21 @@ def main() -> int:
         return 2
 
     try:
-        group_path, milestone_id = parse_milestone_url(args.milestone_url)
+        group_path, milestone_iid = parse_milestone_url(args.milestone_url)
     except Exception as e:
         sys.stderr.write(f"Error parsing --milestone-url: {e}\n")
         return 2
 
     if args.verbose:
         sys.stderr.write(
-            f"Parsed milestone URL: group_path={group_path!r}, milestone_id={milestone_id!r}\n"
+            f"Parsed milestone URL: group_path={group_path!r}, milestone_iid={milestone_iid!r}\n"
         )
 
     sess = build_session(token, timeout=args.timeout)
 
     if args.verbose:
-        sys.stderr.write("Fetching milestone details...\n")
-    milestone = fetch_milestone(sess, args.base_url, group_path, milestone_id)
+        sys.stderr.write("Fetching milestone details (by IID)...\n")
+    milestone = fetch_milestone(sess, args.base_url, group_path, milestone_iid)
 
     if args.verbose:
         sys.stderr.write("Fetching open issues for milestone...\n")
@@ -373,7 +395,7 @@ def main() -> int:
         sess,
         args.base_url,
         group_path,
-        milestone_id,
+        milestone,
         per_page=args.per_page,
         verbose=args.verbose,
     )
