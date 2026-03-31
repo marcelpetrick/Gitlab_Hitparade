@@ -123,7 +123,6 @@ def get_paginated(
             for item in data:
                 yield item
         else:
-            # Some endpoints may return an object – yield as single item
             yield data
 
         next_page = resp.headers.get("X-Next-Page")
@@ -141,45 +140,42 @@ def get_paginated(
 # Milestone URL parsing
 # ------------------------------
 
-def parse_milestone_url(milestone_url: str) -> Tuple[str, str]:
-    """Parse a GitLab milestone URL and return (group_path, milestone_iid_as_string).
+def parse_milestone_url(milestone_url: str) -> Tuple[str, str, str]:
+    """Parse a GitLab milestone URL and return (kind, namespace_path, milestone_iid).
 
-    Example path:
-      /groups/easyanalyzer/-/milestones/6
-    or with nested groups:
-      /groups/parent-group/sub-group/-/milestones/6
+    Supports:
+      /groups/<group>/-/milestones/<iid>
+      /<namespace>/<project>/-/milestones/<iid>
     """
     parsed = urlparse(milestone_url)
     path = parsed.path
     parts = [p for p in path.split("/") if p]
 
     try:
-        idx_groups = parts.index("groups")
-    except ValueError:
-        raise ValueError(f"Could not find 'groups' in milestone URL path: {path!r}")
-
-    try:
         idx_dash = parts.index("-")
-    except ValueError:
-        raise ValueError(f"Could not find '-' in milestone URL path: {path!r}")
-
-    if idx_dash <= idx_groups + 1:
-        raise ValueError(f"Could not determine group path from URL path: {path!r}")
-
-    group_path_parts = parts[idx_groups + 1 : idx_dash]
-    group_path = "/".join(group_path_parts)
-
-    try:
         idx_m = parts.index("milestones")
     except ValueError:
-        raise ValueError(f"Could not find 'milestones' in milestone URL path: {path!r}")
+        raise ValueError(f"Invalid milestone URL path: {path!r}")
 
     try:
         milestone_iid = parts[idx_m + 1]
     except IndexError:
         raise ValueError(f"Could not find milestone iid after 'milestones' in path: {path!r}")
 
-    return group_path, milestone_iid
+    # detect group vs project
+    if parts[0] == "groups":
+        namespace_parts = parts[1:idx_dash]
+        kind = "group"
+    else:
+        namespace_parts = parts[:idx_dash]
+        kind = "project"
+
+    if not namespace_parts:
+        raise ValueError(f"Could not determine namespace from URL path: {path!r}")
+
+    namespace_path = "/".join(namespace_parts)
+
+    return kind, namespace_path, milestone_iid
 
 
 # ------------------------------
@@ -189,15 +185,18 @@ def parse_milestone_url(milestone_url: str) -> Tuple[str, str]:
 def fetch_milestone(
     session: requests.Session,
     base_url: str,
-    group_path: str,
+    kind: str,
+    namespace: str,
     milestone_iid: str,
 ) -> dict:
-    """Fetch milestone details by IID (the number in the UI URL).
+    """Fetch milestone details by IID."""
+    encoded = quote_plus(namespace)
 
-    We query /groups/:id/milestones?iids[]=IID and return the first match.
-    """
-    group_id = quote_plus(group_path)
-    url = f"{base_url.rstrip('/')}/api/v4/groups/{group_id}/milestones"
+    if kind == "group":
+        url = f"{base_url.rstrip('/')}/api/v4/groups/{encoded}/milestones"
+    else:
+        url = f"{base_url.rstrip('/')}/api/v4/projects/{encoded}/milestones"
+
     params = {"iids[]": milestone_iid}
 
     resp = session.get(url, params=params)
@@ -207,36 +206,37 @@ def fetch_milestone(
     data = resp.json()
     if not isinstance(data, list) or not data:
         raise RuntimeError(
-            f"No milestone found for IID={milestone_iid!r} in group {group_path!r}"
+            f"No milestone found for IID={milestone_iid!r} in {namespace!r}"
         )
 
-    # Usually there will be exactly one
     return data[0]
 
 
 def fetch_milestone_issues(
     session: requests.Session,
     base_url: str,
-    group_path: str,
+    kind: str,
+    namespace: str,
     milestone: dict,
     per_page: int,
     verbose: bool,
 ) -> List[dict]:
-    """Fetch all *open* issues for a given milestone using the group issues endpoint.
+    """Fetch all issues (open + closed) for a given milestone."""
+    encoded = quote_plus(namespace)
 
-    We filter by milestone title:
-      GET /groups/:id/issues?milestone=<title>&state=opened
-    """
-    group_id = quote_plus(group_path)
-    url = f"{base_url.rstrip('/')}/api/v4/groups/{group_id}/issues"
+    if kind == "group":
+        url = f"{base_url.rstrip('/')}/api/v4/groups/{encoded}/issues"
+    else:
+        url = f"{base_url.rstrip('/')}/api/v4/projects/{encoded}/issues"
+
     milestone_title = milestone.get("title")
     if not milestone_title:
-        raise RuntimeError("Milestone object has no title field; cannot filter issues by milestone.")
+        raise RuntimeError("Milestone object has no title field.")
 
     params = {
-        "state": "opened",            # only not-done issues
+        "state": "all",               # include open + closed
         "milestone": milestone_title,
-        "include_subgroups": "true",  # pick up issues from subgroups too, if you use them
+        "include_subgroups": "true",  # harmless for projects
     }
 
     return list(get_paginated(session, url, params=params, per_page=per_page, verbose=verbose))
@@ -247,7 +247,6 @@ def fetch_milestone_issues(
 # ------------------------------
 
 def format_seconds(seconds: int) -> str:
-    """Format seconds as 'Xh Ym'. 0 -> '0h'."""
     if seconds is None or seconds <= 0:
         return "0h"
     minutes_total = seconds // 60
@@ -261,12 +260,8 @@ def format_seconds(seconds: int) -> str:
     return " ".join(parts) if parts else "0h"
 
 
-def build_issue_rows(issues: List[dict]) -> Tuple[List[Tuple[str, str, str, str]], int, int, int]:
-    """Return (rows, total_estimate, total_spent, total_remaining).
-
-    Each row is (issue_label, est_str, spent_str, remaining_str).
-    """
-    rows: List[Tuple[str, str, str, str]] = []
+def build_issue_rows(issues: List[dict]):
+    rows = []
     total_estimate = 0
     total_spent = 0
     total_remaining = 0
@@ -275,88 +270,59 @@ def build_issue_rows(issues: List[dict]) -> Tuple[List[Tuple[str, str, str, str]
         iid = issue.get("iid")
         title = issue.get("title") or ""
         label = f"#{iid} {title}".strip()
-        # truncate for nicer table
         if len(label) > 70:
             label = label[:67] + "..."
 
         time_stats = issue.get("time_stats") or {}
         est = int(time_stats.get("time_estimate") or 0)
         spent = int(time_stats.get("total_time_spent") or 0)
-        remaining = est - spent
-        if remaining < 0:
-            remaining = 0
+        remaining = max(est - spent, 0)
 
         total_estimate += est
         total_spent += spent
         total_remaining += remaining
 
-        rows.append(
-            (label, format_seconds(est), format_seconds(spent), format_seconds(remaining))
-        )
+        rows.append((label, format_seconds(est), format_seconds(spent), format_seconds(remaining)))
 
     return rows, total_estimate, total_spent, total_remaining
 
 
-def print_report(
-    milestone: dict,
-    issues: List[dict],
-) -> None:
-    rows, total_estimate, total_spent, total_remaining = build_issue_rows(issues)
+def print_report(milestone: dict, issues: List[dict]) -> None:
+    open_issues = [i for i in issues if i.get("state") == "opened"]
+    closed_issues = [i for i in issues if i.get("state") == "closed"]
 
     milestone_title = milestone.get("title") or ""
     milestone_id = milestone.get("id")
     milestone_state = milestone.get("state") or ""
+
     print("=" * 80)
     print("GitLab Sprint Time Summary")
     print("-" * 80)
     print(f"Milestone: {milestone_title} (id={milestone_id}, state={milestone_state})")
-    print(f"Open issues: {len(issues)}")
+    print(f"Open issues: {len(open_issues)} | Closed issues: {len(closed_issues)}")
     print("=" * 80)
 
-    if not issues:
-        print("No open issues found for this milestone.")
-        return
+    def print_section(title: str, items: List[dict]):
+        rows, total_estimate, total_spent, total_remaining = build_issue_rows(items)
 
-    # Determine column widths
-    issue_col_name = "Issue"
-    est_col_name = "Estimate"
-    spent_col_name = "Spent"
-    rem_col_name = "Remaining"
+        print(f"\n{title}: {len(items)}")
+        if not items:
+            print("None")
+            return
 
-    issue_width = max(len(issue_col_name), max(len(r[0]) for r in rows))
-    est_width = max(len(est_col_name), max(len(r[1]) for r in rows))
-    spent_width = max(len(spent_col_name), max(len(r[2]) for r in rows))
-    rem_width = max(len(rem_col_name), max(len(r[3]) for r in rows))
+        issue_width = max(len(r[0]) for r in rows)
+        header = f"{'Issue':<{issue_width}}  {'Estimate':>10}  {'Spent':>10}  {'Remaining':>10}"
+        print(header)
+        print("-" * len(header))
 
-    header = (
-        f"{issue_col_name:<{issue_width}}  "
-        f"{est_col_name:>{est_width}}  "
-        f"{spent_col_name:>{spent_width}}  "
-        f"{rem_col_name:>{rem_width}}"
-    )
-    print(header)
-    print("-" * len(header))
+        for label, est, spent, rem in rows:
+            print(f"{label:<{issue_width}}  {est:>10}  {spent:>10}  {rem:>10}")
 
-    for issue_label, est_s, spent_s, rem_s in rows:
-        line = (
-            f"{issue_label:<{issue_width}}  "
-            f"{est_s:>{est_width}}  "
-            f"{spent_s:>{spent_width}}  "
-            f"{rem_s:>{rem_width}}"
-        )
-        print(line)
+        print("-" * len(header))
+        print(f"{'TOTAL':<{issue_width}}  {format_seconds(total_estimate):>10}  {format_seconds(total_spent):>10}  {format_seconds(total_remaining):>10}")
 
-    print("-" * len(header))
-    total_est_s = format_seconds(total_estimate)
-    total_spent_s = format_seconds(total_spent)
-    total_rem_s = format_seconds(total_remaining)
-    total_line = (
-        f"{'TOTAL':<{issue_width}}  "
-        f"{total_est_s:>{est_width}}  "
-        f"{total_spent_s:>{spent_width}}  "
-        f"{total_rem_s:>{rem_width}}"
-    )
-    print(total_line)
+    print_section("OPEN ISSUES", open_issues)
+    print_section("CLOSED ISSUES", closed_issues)
     print("=" * 80)
 
 
@@ -373,28 +339,29 @@ def main() -> int:
         return 2
 
     try:
-        group_path, milestone_iid = parse_milestone_url(args.milestone_url)
+        kind, namespace, milestone_iid = parse_milestone_url(args.milestone_url)
     except Exception as e:
         sys.stderr.write(f"Error parsing --milestone-url: {e}\n")
         return 2
 
     if args.verbose:
         sys.stderr.write(
-            f"Parsed milestone URL: group_path={group_path!r}, milestone_iid={milestone_iid!r}\n"
+            f"Parsed milestone URL: kind={kind!r}, namespace={namespace!r}, milestone_iid={milestone_iid!r}\n"
         )
 
     sess = build_session(token, timeout=args.timeout)
 
     if args.verbose:
         sys.stderr.write("Fetching milestone details (by IID)...\n")
-    milestone = fetch_milestone(sess, args.base_url, group_path, milestone_iid)
+    milestone = fetch_milestone(sess, args.base_url, kind, namespace, milestone_iid)
 
     if args.verbose:
-        sys.stderr.write("Fetching open issues for milestone...\n")
+        sys.stderr.write("Fetching issues for milestone (open + closed)...\n")
     issues = fetch_milestone_issues(
         sess,
         args.base_url,
-        group_path,
+        kind,
+        namespace,
         milestone,
         per_page=args.per_page,
         verbose=args.verbose,
