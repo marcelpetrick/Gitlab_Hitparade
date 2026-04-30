@@ -1,6 +1,12 @@
 # GitLab Monthly Activity Report
 This script queries a self‑hosted GitLab instance and summarizes user activity for the previous calendar month.
 
+**Author: Marcel Petrick <mail@marcelpetrick.it>**
+
+**Note: projected is generated with AI.**
+
+**License: GPLv3 or later. See `LICENSE`.**
+
 ## Features
 - Lists all users visible to your account
 - Collects each user’s activity events between the first and last day of the previous month
@@ -54,10 +60,6 @@ Merge Requests Opened 33
 Comments 204
 =======================================================================
 ```
-
-## License
-* GPLv3
-* Author: Marcel Petrick // mail@marcelpetrick.it
 
 ------
 
